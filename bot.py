@@ -31,8 +31,9 @@ from telegram.ext import (
     filters,
 )
 
-# ================= CONFIGURATION =================
-TELEGRAM_BOT_TOKEN = os.environ.get("8806455863:AAGRHE2BU2IJX7mLr288VT2ksObSB5mppDE", "").strip()
+# ================= CONFIGURATION ================
+TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
+print("token len:", len(TELEGRAM_BOT_TOKEN), repr(TELEGRAM_BOT_TOKEN[:3]), repr(TELEGRAM_BOT_TOKEN[-2:]), flush=True)
 
 PORT = int(os.environ.get("PORT", 10000))
 
