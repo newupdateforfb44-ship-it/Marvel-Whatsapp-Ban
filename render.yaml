@@ -1,0 +1,17 @@
+services:
+  - type: web
+    name: whatsapp-report-bot
+    runtime: docker
+    plan: free              # change to 'free' if you don't need the disk (see README notes)
+    healthCheckPath: /
+    disk:                      # keeps the WhatsApp login across deploys (needs a paid plan)
+      name: chrome-profile
+      mountPath: /data
+      sizeGB: 1
+    envVars:
+      - key: TELEGRAM_BOT_TOKEN
+        sync: false           # set this in the Render dashboard (secret)
+      - key: PYTHONUNBUFFERED
+        value: "1"
+      - key: REPORTS_PER_RUN
+        value: "60"
