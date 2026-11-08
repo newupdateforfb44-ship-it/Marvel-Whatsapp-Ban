@@ -552,46 +552,7 @@ async def pair_code_flow(chat_id, number, context):
         )
 
 
-# ================= QR LOGIN FLOW =================
-async def qr_login_flow(chat_id, context):
-    driver = await get_driver()
-    if driver is None:
-        await context.bot.send_message(chat_id, "⚠️ Could not start the browser. Check the Render logs.", reply_markup=back_kb())
-        return
-
-    await context.bot.send_message(
-        chat_id,
-        "📷 On your phone: WhatsApp → ⚙️ Settings → Linked devices → Link a device.\n"
-        "Scan the QR code in the photo I send next — QR codes expire fast!"
-    )
-
-    for attempt in range(1, MAX_LOGIN_ATTEMPTS + 1):
-        try:
-            await asyncio.to_thread(driver.get, WHATSAPP_URL)
-        except Exception as e:
-            logger.warning("Could not load WhatsApp Web: %s", e)
-            await asyncio.sleep(3)
-            continue
-
-        await asyncio.sleep(6)
-
-        for _ in range(20):
-            if await asyncio.to_thread(_is_logged_in_sync, driver):
-                _mark_logged_in()
-                await context.bot.send_message(
-                    chat_id,
-                    "✅ WhatsApp linked successfully!\nYou can now use 🚀 Start Reporting.",
-                    reply_markup=main_menu_keyboard(),
-                )
-                return
-            await asyncio.sleep(1)
-
-        try:
-            png = await asyncio.to_thread(_qr_screenshot, driver)
-            await context.bot.send_p
-
-
-================= QR LOGIN FLOW =================
+# ================== QR LOGIN FLOW =================
 async def qr_login_flow(chat_id, context):
     driver = await get_driver()
     if driver is None:
