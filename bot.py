@@ -685,16 +685,15 @@ async def on_error(update, context):
 
 
 def validate_token_sync(token: str):
-    """Talks to Telegram BEFORE polling starts. Returns (username, id) or raises."""
-    import asyncio as _asyncio
-
-    async def _check():
-        bot = Bot(token)
-        me = await bot.get_me()
-        await bot.shutdown()
-        return me.username, me.id
-
-    return _asyncio.run(_check())
+    """Checks the token with a plain HTTP request — no asyncio, no event loops."""
+    import json
+    url = f"https://api.telegram.org/bot{token}/getMe"
+    with urllib.request.urlopen(url, timeout=30) as resp:
+        data = json.loads(resp.read().decode())
+    if not data.get("ok"):
+        raise RuntimeError(data.get("description", "Unknown Telegram error"))
+    result = data["result"]
+    return result.get("username", "unknown_bot"), result.get("id", 0)
 
 
 def main():
