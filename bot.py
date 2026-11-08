@@ -704,8 +704,10 @@ def validate_token_sync(token: str):
     Talks to Telegram BEFORE the polling loop starts.
     Returns the bot's username on success, raises on failure.
     """
+    import asyncio
+
     bot = Bot(token)
-    me = bot.get_me()  # sync call inside our startup thread; blocking is fine here
+    me = asyncio.run(bot.get_me())
     return me.username, me.id
 
 
