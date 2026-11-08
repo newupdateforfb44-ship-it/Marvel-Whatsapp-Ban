@@ -2,17 +2,6 @@
 """
 WhatsApp Report Bot — Telegram frontend + Selenium (Chromium) backend.
 Built for deployment on Render (Docker runtime).
-
-Startup flow:
-1. Reads the token from the TELEGRAM_BOT_TOKEN environment variable
-   (Render → Environment), with an optional code fallback below.
-2. VALIDATES the token with Telegram BEFORE starting polling, and
-   logs the bot's @username so you know which bot to chat with.
-3. Retries automatically on Conflict (old instance) and network errors.
-
-Linking methods for WhatsApp:
-- Pair Code (recommended: code arrives as text in Telegram)
-- QR Code (photo sent in Telegram)
 """
 import asyncio
 import logging
@@ -27,10 +16,8 @@ from selenium import webdriver
 from selenium.webdriver.chrome.options import Options
 from selenium.webdriver.chrome.service import Service
 from selenium.webdriver.common.by import By
-from selenium.webdriver.common.keys import Keys
 
 from telegram import Bot, InlineKeyboardButton, InlineKeyboardMarkup, Update
-from telegram.error import InvalidToken, Conflict
 from telegram.ext import (
     Application,
     CallbackQueryHandler,
@@ -43,8 +30,7 @@ from telegram.ext import (
 # ================= CONFIGURATION =================
 # OPTION A (recommended): set TELEGRAM_BOT_TOKEN in Render → Environment.
 # OPTION B (fallback): paste your token between the quotes below.
-# If both exist, the environment variable wins.
-TOKEN_IN_CODE = ""  # e.g. "8801234567:AAE..."
+TOKEN_IN_CODE = ""  # e.g. "8806455863:AAxxxx..."
 
 TELEGRAM_BOT_TOKEN = (os.environ.get("TELEGRAM_BOT_TOKEN", "").strip() or TOKEN_IN_CODE.strip())
 
@@ -58,7 +44,7 @@ REPORTS_PER_RUN = int(os.environ.get("REPORTS_PER_RUN", "60"))
 DELAY_BETWEEN_REPORTS = float(os.environ.get("DELAY_BETWEEN_REPORTS", "2"))
 PROGRESS_UPDATE_INTERVAL = int(os.environ.get("PROGRESS_UPDATE_INTERVAL", "10"))
 MAX_LOGIN_ATTEMPTS = 8
-PAIR_CODE_TIMEOUT = 120  # seconds to wait for the user to enter the code on their phone
+PAIR_CODE_TIMEOUT = 120
 
 UA = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
@@ -458,7 +444,6 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     elif data == "cancel":
         job["cancel"] = True
-        await query.answer("🛑 Cancelling…")
 
 
 def _clean_number(text: str):
@@ -552,7 +537,7 @@ async def pair_code_flow(chat_id, number, context):
         )
 
 
-# ================== QR LOGIN FLOW =================
+# ================= QR LOGIN FLOW =================
 async def qr_login_flow(chat_id, context):
     driver = await get_driver()
     if driver is None:
@@ -605,7 +590,7 @@ async def qr_login_flow(chat_id, context):
                 return
         break
 
-    await context.bot.send_message(
+        await context.bot.send_message(
         chat_id,
         "❌ QR login timed out. Try 🔗 Link via Pair Code instead — it's easier.",
         reply_markup=main_menu_keyboard(),
@@ -700,20 +685,20 @@ async def on_error(update, context):
 
 
 def validate_token_sync(token: str):
-    """
-    Talks to Telegram BEFORE the polling loop starts.
-    Returns the bot's username on success, raises on failure.
-    """
-    import asyncio
+    """Talks to Telegram BEFORE polling starts. Returns (username, id) or raises."""
+    import asyncio as _asyncio
 
-    bot = Bot(token)
-    me = asyncio.run(bot.get_me())
-    return me.username, me.id
+    async def _check():
+        bot = Bot(token)
+        me = await bot.get_me()
+        await bot.shutdown()
+        return me.username, me.id
+
+    return _asyncio.run(_check())
 
 
 def main():
     if not TELEGRAM_BOT_TOKEN:
-        # Super clear message so the fix is obvious from Render logs alone
         logger.error("=" * 60)
         logger.error("NO BOT TOKEN FOUND!")
         logger.error("Set TELEGRAM_BOT_TOKEN in Render → Environment, or paste")
@@ -724,19 +709,17 @@ def main():
     # ---- Validate the token with Telegram before doing anything else ----
     try:
         username, bot_id = validate_token_sync(TELEGRAM_BOT_TOKEN)
-    except InvalidToken:
+    except SystemExit:
+        raise
+    except Exception as e:
         logger.error("=" * 60)
-        logger.error("TOKEN REJECTED BY TELEGRAM (401 Unauthorized)!")
+        logger.error("TOKEN REJECTED BY TELEGRAM: %s", e)
         logger.error("The token in Render → Environment is old, revoked, or mistyped.")
         logger.error("Fix: open @BotFather → /mybots → your bot → API Token,")
         logger.error("copy the CURRENT token, paste it into Render Environment,")
         logger.error("then Save & Deploy.")
         logger.error("=" * 60)
         raise SystemExit("Invalid bot token")
-    except Conflict:
-        logger.warning("Another instance is using this token — but startup Conflict here is rare; continuing.")
-    except Exception as e:
-        logger.warning("Could not verify token yet (network issue?): %s — will retry during startup", e)
 
     logger.info("=" * 60)
     logger.info("TOKEN IS VALID ✅")
@@ -757,24 +740,9 @@ def main():
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text))
     app.add_error_handler(on_error)
 
-    # Retry loop: Conflict (another instance) and network hiccups no longer
-    # kill the bot — it waits and retries instead of "Application exited early".
-    for attempt in range(1, 13):  # up to ~12 attempts ≈ 6 minutes of retrying
-        try:
-            logger.info("Bot is up — polling Telegram… (attempt %d)", attempt)
-            app.run_polling(allowed_updates=Update.ALL_TYPES, drop_pending_updates=True)
-            break  # clean shutdown
-        except Conflict:
-            logger.warning(
-                "Attempt %d: another bot instance is still polling with this token. "
-                "Waiting 20s for it to die… (this fixes itself after a revoke/restart)", attempt
-            )
-            time.sleep(20)
-        except Exception as e:
-            logger.warning("Attempt %d: startup failed: %s — retrying in 15s", attempt, e)
-            time.sleep(15)
-    else:
-        raise SystemExit("Could not start polling after 12 attempts. Check Render logs above.")
+    # Single clean call — PTB manages its own internal retries from here.
+    logger.info("Bot is up — polling Telegram…")
+    app.run_polling(allowed_updates=Update.ALL_TYPES, drop_pending_updates=True)
 
 
 if __name__ == "__main__":
