@@ -500,8 +500,8 @@ async def pair_code_flow(chat_id, number, context):
             reply_markup=main_menu_keyboard(),
         )
         return
+
     if not code:
-        if not code:
         # Send a screenshot of the login screen so we can see what's happening
         try:
             png = await asyncio.to_thread(_qr_screenshot, driver)
@@ -518,7 +518,6 @@ async def pair_code_flow(chat_id, number, context):
             reply_markup=main_menu_keyboard(),
         )
         return
-        
 
     await context.bot.send_message(
         chat_id,
@@ -546,6 +545,8 @@ async def pair_code_flow(chat_id, number, context):
             "❌ Pair-code login timed out. Tap 🔗 Link via Pair Code to try again with a fresh code.",
             reply_markup=main_menu_keyboard(),
         )
+
+    
 
 
 # ================= QR LOGIN FLOW =================
