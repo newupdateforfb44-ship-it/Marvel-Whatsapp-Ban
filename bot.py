@@ -501,13 +501,24 @@ async def pair_code_flow(chat_id, number, context):
         )
         return
     if not code:
+        if not code:
+        # Send a screenshot of the login screen so we can see what's happening
+        try:
+            png = await asyncio.to_thread(_qr_screenshot, driver)
+            await context.bot.send_photo(
+                chat_id, png,
+                caption="❌ Pair code failed — this is what WhatsApp's screen looks like. "
+                        "Showing you so we can diagnose it. (You can also try 📷 QR instead.)"
+            )
+        except Exception:
+            pass
         await context.bot.send_message(
             chat_id,
-            "❌ Couldn't generate a pair code (WhatsApp's login screen may have changed).\n"
-            "Try 📷 Link via QR Code instead, or try again in a minute.",
+            "❌ Couldn't generate a pair code.\nTry 📷 Link via QR Code instead, or try again.",
             reply_markup=main_menu_keyboard(),
         )
         return
+        
 
     await context.bot.send_message(
         chat_id,
