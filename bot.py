@@ -3,9 +3,16 @@
 WhatsApp Report Bot — Telegram frontend + Selenium (Chromium) backend.
 Built for deployment on Render (Docker runtime).
 
-Linking methods:
-- QR code scan (photo sent in Telegram)
-- Pair code (8-char code sent in Telegram)  <-- recommended for headless servers
+Startup flow:
+1. Reads the token from the TELEGRAM_BOT_TOKEN environment variable
+   (Render → Environment), with an optional code fallback below.
+2. VALIDATES the token with Telegram BEFORE starting polling, and
+   logs the bot's @username so you know which bot to chat with.
+3. Retries automatically on Conflict (old instance) and network errors.
+
+Linking methods for WhatsApp:
+- Pair Code (recommended: code arrives as text in Telegram)
+- QR Code (photo sent in Telegram)
 """
 import asyncio
 import logging
@@ -20,8 +27,10 @@ from selenium import webdriver
 from selenium.webdriver.chrome.options import Options
 from selenium.webdriver.chrome.service import Service
 from selenium.webdriver.common.by import By
+from selenium.webdriver.common.keys import Keys
 
-from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
+from telegram import Bot, InlineKeyboardButton, InlineKeyboardMarkup, Update
+from telegram.error import InvalidToken, Conflict
 from telegram.ext import (
     Application,
     CallbackQueryHandler,
@@ -31,9 +40,13 @@ from telegram.ext import (
     filters,
 )
 
-# ================= CONFIGURATION ================
-TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
-print("token len:", len(TELEGRAM_BOT_TOKEN), repr(TELEGRAM_BOT_TOKEN[:3]), repr(TELEGRAM_BOT_TOKEN[-2:]), flush=True)
+# ================= CONFIGURATION =================
+# OPTION A (recommended): set TELEGRAM_BOT_TOKEN in Render → Environment.
+# OPTION B (fallback): paste your token between the quotes below.
+# If both exist, the environment variable wins.
+TOKEN_IN_CODE = ""  # e.g. "8801234567:AAE..."
+
+TELEGRAM_BOT_TOKEN = (os.environ.get("TELEGRAM_BOT_TOKEN", "").strip() or TOKEN_IN_CODE.strip())
 
 PORT = int(os.environ.get("PORT", 10000))
 
@@ -58,6 +71,7 @@ logging.basicConfig(
     level=logging.INFO,
 )
 logger = logging.getLogger("bot")
+logging.getLogger("httpx").setLevel(logging.WARNING)   # hide token-bearing URLs from logs
 
 # ================= STATE =================
 _driver = None
@@ -72,7 +86,7 @@ job = {
     "success": 0,
 }
 lifetime_success = 0
-linked_flag = {"value": False}  # caches login state; reset on session expiry
+linked_flag = {"value": False}
 
 
 # ================= RENDER HEALTH CHECK =================
@@ -149,25 +163,11 @@ async def get_driver():
         return _driver
 
 
-async def reset_driver():
-    """Kill and rebuild the browser (used when a session expires)."""
-    global _driver, linked_flag
-    async with _driver_lock:
-        if _driver is not None:
-            try:
-                await asyncio.to_thread(_driver.quit)
-            except Exception:
-                pass
-            _driver = None
-    linked_flag["value"] = False
-
-
 class LoginRequired(Exception):
     pass
 
 
 def _is_logged_in_sync(driver) -> bool:
-    """The chat search box only exists after a successful WhatsApp Web login."""
     return bool(driver.find_elements(By.CSS_SELECTOR, "div[contenteditable='true'][data-tab='3']"))
 
 
@@ -191,7 +191,6 @@ REPORT_CONFIRM_BUTTONS = [
     "//div[@role='dialog']//div[@role='button'][normalize-space()='Report']",
     "//div[@role='dialog']//button[contains(., 'Report')]",
 ]
-# 'Link with phone number' link on the QR login screen
 PAIR_LINK_XPATHS = [
     "//*[contains(text(), 'Link with phone number')]",
     "//a[contains(., 'Link with phone number')]",
@@ -215,7 +214,6 @@ def _click_first(driver, xpaths, timeout=12) -> bool:
 
 
 def _wait_logged_in_sync(driver, seconds: int = 60) -> bool:
-    """Polls until logged in (or timeout). Pair-code users need this after typing the code."""
     deadline = time.time() + seconds
     while time.time() < deadline:
         if _is_logged_in_sync(driver):
@@ -225,10 +223,7 @@ def _wait_logged_in_sync(driver, seconds: int = 60) -> bool:
 
 
 def get_pair_code_sync(driver, number: str):
-    """
-    Drives the 'Link with phone number' flow and returns the 8-char pair code.
-    Returns the code string, or None on failure.
-    """
+    """Drives the 'Link with phone number' flow and returns the 8-char pair code."""
     driver.get(WHATSAPP_URL)
     time.sleep(6)
 
@@ -236,13 +231,11 @@ def get_pair_code_sync(driver, number: str):
         _mark_logged_in()
         return "ALREADY_LINKED"
 
-    # 1. Click 'Link with phone number'
     if not _click_first(driver, PAIR_LINK_XPATHS, timeout=20):
         logger.warning("Pair-code link not found on login screen")
         return None
     time.sleep(2)
 
-    # 2. Enter the phone number into the input box
     phone_input = None
     for _ in range(10):
         inputs = driver.find_elements(By.XPATH, "//input")
@@ -267,7 +260,6 @@ def get_pair_code_sync(driver, number: str):
         return None
     time.sleep(1)
 
-    # 3. Click 'Next'
     clicked = _click_first(driver, [
         "//button//div[contains(text(), 'Next')]",
         "//button[contains(., 'Next')]",
@@ -277,8 +269,6 @@ def get_pair_code_sync(driver, number: str):
         logger.warning("Next button not found for pair code")
         return None
 
-    # 4. Wait for the 8-character code to appear and read it
-    #    Codes look like 'AB12-CD34' or 'AB12CD34'.
     code_re = re.compile(r"\b([A-Z0-9]{4}-?[A-Z0-9]{4})\b")
     deadline = time.time() + 30
     while time.time() < deadline:
@@ -479,7 +469,7 @@ def _clean_number(text: str):
 async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     step = context.user_data.get("step")
     if not step:
-        return  # ignore stray messages
+        return
 
     number = _clean_number(update.message.text)
     if not number:
@@ -593,4 +583,236 @@ async def qr_login_flow(chat_id, context):
                     "✅ WhatsApp linked successfully!\nYou can now use 🚀 Start Reporting.",
                     reply_markup=main_menu_keyboard(),
                 )
-       
+                return
+            await asyncio.sleep(1)
+
+        try:
+            png = await asyncio.to_thread(_qr_screenshot, driver)
+            await context.bot.send_p
+
+
+================= QR LOGIN FLOW =================
+async def qr_login_flow(chat_id, context):
+    driver = await get_driver()
+    if driver is None:
+        await context.bot.send_message(chat_id, "⚠️ Could not start the browser. Check the Render logs.", reply_markup=back_kb())
+        return
+
+    await context.bot.send_message(
+        chat_id,
+        "📷 On your phone: WhatsApp → ⚙️ Settings → Linked devices → Link a device.\n"
+        "Scan the QR code in the photo I send next — QR codes expire fast!"
+    )
+
+    for attempt in range(1, MAX_LOGIN_ATTEMPTS + 1):
+        try:
+            await asyncio.to_thread(driver.get, WHATSAPP_URL)
+        except Exception as e:
+            logger.warning("Could not load WhatsApp Web: %s", e)
+            await asyncio.sleep(3)
+            continue
+
+        await asyncio.sleep(6)
+
+        for _ in range(20):
+            if await asyncio.to_thread(_is_logged_in_sync, driver):
+                _mark_logged_in()
+                await context.bot.send_message(
+                    chat_id,
+                    "✅ WhatsApp linked successfully!\nYou can now use 🚀 Start Reporting.",
+                    reply_markup=main_menu_keyboard(),
+                )
+                return
+            await asyncio.sleep(1)
+
+        try:
+            png = await asyncio.to_thread(_qr_screenshot, driver)
+            await context.bot.send_photo(chat_id, png, caption=f"📷 QR code {attempt}/{MAX_LOGIN_ATTEMPTS} — scan it now!")
+        except Exception as e:
+            logger.warning("QR screenshot failed: %s", e)
+            continue
+
+        for _ in range(25):
+            await asyncio.sleep(1)
+            if await asyncio.to_thread(_is_logged_in_sync, driver):
+                _mark_logged_in()
+                await context.bot.send_message(
+                    chat_id,
+                    "✅ WhatsApp linked successfully!\nYou can now use 🚀 Start Reporting.",
+                    reply_markup=main_menu_keyboard(),
+                )
+                return
+        break
+
+    await context.bot.send_message(
+        chat_id,
+        "❌ QR login timed out. Try 🔗 Link via Pair Code instead — it's easier.",
+        reply_markup=main_menu_keyboard(),
+    )
+
+
+# ================= REPORT JOB =================
+async def run_report_job(chat_id, number, context):
+    global lifetime_success
+    job.update(running=True, cancel=False, number=number, done=0, total=REPORTS_PER_RUN, success=0)
+
+    driver = await get_driver()
+    if driver is None:
+        job["running"] = False
+        await context.bot.send_message(chat_id, "⚠️ Could not start the browser. Check the Render logs.", reply_markup=back_kb())
+        return
+
+    status = await context.bot.send_message(chat_id, "🔎 Checking WhatsApp login…", reply_markup=cancel_kb())
+
+    logged_in = False
+    try:
+        await asyncio.to_thread(driver.get, WHATSAPP_URL)
+        for _ in range(20):
+            await asyncio.sleep(1)
+            if await asyncio.to_thread(_is_logged_in_sync, driver):
+                logged_in = True
+                break
+    except Exception as e:
+        logger.warning("Login check failed: %s", e)
+
+    if not logged_in:
+        job["running"] = False
+        await status.edit_text(
+            "⚠️ WhatsApp is not linked.\nTap 🔗 Link via Pair Code (easiest) or 📷 Link via QR Code, then try again.",
+            reply_markup=back_kb(),
+        )
+        return
+
+    _mark_logged_in()
+    await status.edit_text("✅ WhatsApp linked. Reporting…", reply_markup=cancel_kb())
+
+    for i in range(job["total"]):
+        if job["cancel"]:
+            break
+        try:
+            ok = await asyncio.to_thread(report_number_sync, driver, number)
+        except LoginRequired:
+            job["running"] = False
+            linked_flag["value"] = False
+            await status.edit_text(
+                "⚠️ WhatsApp session expired mid-run.\nUse 🔗 Link via Pair Code to link again.",
+                reply_markup=back_kb(),
+            )
+            return
+
+        job["done"] = i + 1
+        if ok:
+            job["success"] += 1
+            lifetime_success += 1
+
+        if job["done"] % PROGRESS_UPDATE_INTERVAL == 0 or job["done"] == job["total"]:
+            try:
+                await status.edit_text(
+                    f"🔄 Progress: {job['done']}/{job['total']} — ✅ {job['success']} successful",
+                    reply_markup=cancel_kb(),
+                )
+            except Exception:
+                pass
+
+        await asyncio.sleep(DELAY_BETWEEN_REPORTS)
+
+    await context.bot.send_message(
+        chat_id,
+        f"{'🛑 Cancelled!' if job['cancel'] else '✅ Process complete!'}\n"
+        f"Number: +{number}\n"
+        f"Reports sent: {job['success']}/{job['done']}\n"
+        f"Lifetime successful reports: {lifetime_success}\n\n"
+        "🔹 Developed by Marvel",
+        reply_markup=back_kb(),
+    )
+    job["running"] = False
+
+
+# ================= MAIN =================
+async def on_error(update, context):
+    logger.error("Exception while handling an update:", exc_info=context.error)
+    try:
+        if isinstance(update, Update) and update.effective_message:
+            await update.effective_message.reply_text("⚠️ Something went wrong. Try again from /menu.")
+    except Exception:
+        pass
+
+
+def validate_token_sync(token: str):
+    """
+    Talks to Telegram BEFORE the polling loop starts.
+    Returns the bot's username on success, raises on failure.
+    """
+    bot = Bot(token)
+    me = bot.get_me()  # sync call inside our startup thread; blocking is fine here
+    return me.username, me.id
+
+
+def main():
+    if not TELEGRAM_BOT_TOKEN:
+        # Super clear message so the fix is obvious from Render logs alone
+        logger.error("=" * 60)
+        logger.error("NO BOT TOKEN FOUND!")
+        logger.error("Set TELEGRAM_BOT_TOKEN in Render → Environment, or paste")
+        logger.error("it into TOKEN_IN_CODE at the top of bot.py")
+        logger.error("=" * 60)
+        raise SystemExit("Missing TELEGRAM_BOT_TOKEN")
+
+    # ---- Validate the token with Telegram before doing anything else ----
+    try:
+        username, bot_id = validate_token_sync(TELEGRAM_BOT_TOKEN)
+    except InvalidToken:
+        logger.error("=" * 60)
+        logger.error("TOKEN REJECTED BY TELEGRAM (401 Unauthorized)!")
+        logger.error("The token in Render → Environment is old, revoked, or mistyped.")
+        logger.error("Fix: open @BotFather → /mybots → your bot → API Token,")
+        logger.error("copy the CURRENT token, paste it into Render Environment,")
+        logger.error("then Save & Deploy.")
+        logger.error("=" * 60)
+        raise SystemExit("Invalid bot token")
+    except Conflict:
+        logger.warning("Another instance is using this token — but startup Conflict here is rare; continuing.")
+    except Exception as e:
+        logger.warning("Could not verify token yet (network issue?): %s — will retry during startup", e)
+
+    logger.info("=" * 60)
+    logger.info("TOKEN IS VALID ✅")
+    logger.info("This bot is: @%s (ID: %s)", username, bot_id)
+    logger.info("Open https://t.me/%s and send /start to use it!", username)
+    logger.info("=" * 60)
+
+    os.makedirs(DATA_DIR, exist_ok=True)
+    start_health_server()
+    start_keepalive_ping()
+
+    app = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
+
+    app.add_handler(CommandHandler("start", cmd_start))
+    app.add_handler(CommandHandler("menu", cmd_menu))
+    app.add_handler(CommandHandler("cancel", cmd_cancel))
+    app.add_handler(CallbackQueryHandler(on_callback))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text))
+    app.add_error_handler(on_error)
+
+    # Retry loop: Conflict (another instance) and network hiccups no longer
+    # kill the bot — it waits and retries instead of "Application exited early".
+    for attempt in range(1, 13):  # up to ~12 attempts ≈ 6 minutes of retrying
+        try:
+            logger.info("Bot is up — polling Telegram… (attempt %d)", attempt)
+            app.run_polling(allowed_updates=Update.ALL_TYPES, drop_pending_updates=True)
+            break  # clean shutdown
+        except Conflict:
+            logger.warning(
+                "Attempt %d: another bot instance is still polling with this token. "
+                "Waiting 20s for it to die… (this fixes itself after a revoke/restart)", attempt
+            )
+            time.sleep(20)
+        except Exception as e:
+            logger.warning("Attempt %d: startup failed: %s — retrying in 15s", attempt, e)
+            time.sleep(15)
+    else:
+        raise SystemExit("Could not start polling after 12 attempts. Check Render logs above.")
+
+
+if __name__ == "__main__":
+    main()
